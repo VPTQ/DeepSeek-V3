@@ -1,8 +1,12 @@
 # 🚀 VPTQ Now Supports Deepseek R1 (671B) Inference on 4×A100 GPUs!
 
-VPTQ now provides preliminary support for inference with Deepseek R1! With our quantized models, you can efficiently run Deepseek R1 on A100 GPUs, which only support BF16/FP16 formats.
+VPTQ now provides preliminary support for inference with Deepseek R1! With our quantized models, you can efficiently run Deepseek R1 on A100 GPUs, which only support BF16/FP16 formats. 
+
+![output](https://github.com/user-attachments/assets/b2e229e0-db6a-4cfd-94fe-4bbf8050457e)
+
 
 Here's a quick start guide for you:
+https://github.com/VPTQ/DeepSeek-V3
 
 ---
 
