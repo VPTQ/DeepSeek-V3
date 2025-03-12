@@ -1,16 +1,20 @@
+from locale import currency
 import math
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
 
+from sympy import get_indices
 import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from kernel import act_quant, weight_dequant, fp8_gemm
+from deepseek.kernel import act_quant, weight_dequant, fp8_gemm
 
+from vptq.layers.vqlinear import VQuantLinear
+import vptq.libvptq as vptq_ops
 
-world_size = 1
+world_size = 4
 rank = 0
 block_size = 128
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
@@ -51,8 +55,8 @@ class ModelArgs:
         beta_slow (int): Slow beta correction factor.
         mscale (float): Scaling factor for extended attention.
     """
-    max_batch_size: int = 8
-    max_seq_len: int = 4096 * 4
+    max_batch_size: int = 1
+    max_seq_len: int = 32768
     dtype: Literal["bf16", "fp8"] = "bf16"
     vocab_size: int = 102400
     dim: int = 2048
@@ -230,6 +234,52 @@ class ColumnParallelLinear(Linear):
         y = linear(x, self.weight, self.bias)
         return y
 
+class ColumnParallelVQLinear(VQuantLinear):
+    def __init__(self, 
+                 in_features: int, 
+                 out_features: int, 
+                 vector_lens: Tuple[int, int],
+                 num_centroids: Tuple[int, int],
+                 num_res_centroids: Tuple[int, int],
+                 group_num: int,
+                 group_size: int,
+                 outlier_size: int,
+                 enable_norm: bool = False,
+                 norm_dim: int = 0,
+                 enable_perm: bool = False,
+                 is_indice_packed: bool = False,
+                 bias: bool = False, 
+                 vector_quant_dim: str = "out",
+                 device=None,
+                 dtype=None,
+                 debug=False,
+                 indices_as_float=None,
+                 enable_proxy_error=False):
+
+        assert out_features % world_size == 0
+        self.part_out_features = out_features // world_size
+
+        super().__init__(in_features=in_features, 
+                         out_features=self.part_out_features, 
+                         vector_lens=vector_lens, 
+                         num_centroids=num_centroids, 
+                         num_res_centroids=num_res_centroids, 
+                         group_num=group_num, 
+                         group_size=group_size, 
+                         outlier_size=outlier_size, 
+                         enable_norm=enable_norm, 
+                         enable_perm=enable_perm, 
+                         is_indice_packed=is_indice_packed, 
+                         bias=bias, 
+                         vector_quant_dim=vector_quant_dim,
+                         device=device, 
+                         dtype=dtype, 
+                         indices_as_float=indices_as_float,
+                         enable_proxy_error=enable_proxy_error)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = super().forward(x)
+        return y
 
 class RowParallelLinear(Linear):
     """
@@ -263,6 +313,58 @@ class RowParallelLinear(Linear):
             y += self.bias
         return y
 
+class RowParallelVQLinear(VQuantLinear):
+    def __init__(self, 
+                 in_features: int, 
+                 out_features: int, 
+                 vector_lens: Tuple[int, int],
+                 num_centroids: Tuple[int, int],
+                 num_res_centroids: Tuple[int, int],
+                 group_num: int,
+                 group_size: int,
+                 outlier_size: int,
+                 enable_norm: bool = False,
+                 norm_dim: int = 0,
+                 enable_perm: bool = False,
+                 is_indice_packed: bool = False,
+                 bias: bool = False, 
+                 vector_quant_dim: str = "out",
+                 device=None,
+                 dtype=None,
+                 debug=False,
+                 indices_as_float=None,
+                 enable_proxy_error=False):
+        
+        assert in_features % world_size == 0
+        assert group_size % world_size == 0
+        self.part_in_features = in_features // world_size
+        self.group_size = group_size // world_size
+        
+        super().__init__(in_features=self.part_in_features, 
+                         out_features=out_features, 
+                         vector_lens=vector_lens, 
+                         num_centroids=num_centroids, 
+                         num_res_centroids=num_res_centroids, 
+                         group_num=group_num, 
+                         group_size=self.group_size, 
+                         outlier_size=outlier_size, 
+                         enable_norm=enable_norm, 
+                         enable_perm=enable_perm, 
+                         is_indice_packed=is_indice_packed, 
+                         bias=bias, 
+                         vector_quant_dim=vector_quant_dim,
+                         device=device, 
+                         dtype=dtype, 
+                         indices_as_float=indices_as_float,
+                         enable_proxy_error=enable_proxy_error)
+                 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = super().forward(x)
+        if world_size > 1:
+            dist.all_reduce(y)
+        if self.bias is not None:
+            y += self.bias
+        return y
 
 class RMSNorm(nn.Module):
     """
@@ -290,6 +392,71 @@ class RMSNorm(nn.Module):
         """
         return F.rms_norm(x, (self.dim,), self.weight, self.eps)
 
+
+def vptq_dequant(linear: VQuantLinear) -> torch.Tensor:
+    bias = linear.bias
+    indices = linear.indices
+    centroids = linear.centroids.weight
+    outlier_indices = linear.outlier_indices
+    outlier_centroids = linear.outlier_centroids
+    residual_indices = linear.res_indices
+    residual_centroids = linear.res_centroids
+    perm = getattr(linear, "perm", None)
+    weight_scale = linear.weight_scale
+    weight_bias = linear.weight_bias
+    vector_len = linear.vector_len
+    outlier_vector_len = linear.outlier_vector_len
+    num_codebooks = linear.num_codebooks
+    num_centroids = linear.num_centroids
+    num_outlier_centroids = linear.num_outlier_centroids
+    num_res_centroids = linear.num_res_centroids
+    is_indice_packed = linear.is_indice_packed
+    group_size = linear.group_size
+    outlier_size = linear.outlier_size
+    in_features = linear.in_features
+    out_features = linear.out_features
+    padding = linear.padding
+    outlier_padding = linear.outlier_padding
+    vector_quant_dim = linear.vector_quant_dim
+    
+    centroids_ = centroids.view(num_codebooks, num_centroids, vector_len)
+
+    residual_centroids_ = None
+    enable_residual = False
+    if residual_centroids is not None:
+        enable_residual = True
+        shape = (num_codebooks, num_res_centroids, vector_len)
+        residual_centroids_ = residual_centroids.weight.view(shape)
+
+    outlier_centroids_ = None
+    enable_outlier = False
+    if outlier_centroids is not None:
+        enable_outlier = True
+        shape = (1, num_outlier_centroids, outlier_vector_len)
+        outlier_centroids_ = outlier_centroids.view(shape)
+
+    enable_perm = perm is not None
+    enable_norm = weight_scale is not None and weight_bias is not None
+
+    invert_perm = None
+    if enable_perm:
+        invert_perm = torch.argsort(perm.view(torch.uint16).to(torch.int64))
+        invert_perm = invert_perm.to(torch.uint16).view(torch.int16)
+                
+    
+    return vptq_ops.dequant(
+        indices,
+        centroids_,
+        residual_indices,
+        residual_centroids_,
+        outlier_indices,
+        outlier_centroids_,
+        invert_perm,
+        weight_scale,
+        weight_bias,
+        vector_len,
+        in_features,
+        out_features) 
 
 def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     """
@@ -475,7 +642,10 @@ class MLA(nn.Module):
             self.v_cache[:bsz, start_pos:end_pos] = v
             scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
         else:
-            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
+            # wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
+            # hack for VPTQ
+            wkv_b = vptq_dequant(self.wkv_b)
+
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
