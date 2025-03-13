@@ -68,7 +68,7 @@ torchrun --nnodes 1 --nproc-per-node 4 \
     --quant-config /home/aiscuser/yangwang/v_8_mix_w13_k65536_w2_wq_wk_wo_dyn_shared_k_65536_256_mp4/config.json \
     --interactive \
     --max-new-tokens 65536 \
-    --temperature 0.15 \
+    --temperature 0.05 \
     --num-load-processes 16
 ```
 
@@ -84,7 +84,7 @@ torchrun --nnodes 1 --nproc-per-node 4 \
     --quant-config /home/aiscuser/yangwang/v_8_mix_w13_k65536_w2_wq_wk_wo_dyn_shared_k_65536_256_mp4/config.json \
     --interactive \
     --max-new-tokens 65536 \
-    --temperature 0.15 \
+    --temperature 0.05 \
     --num-load-processes 1
 ```
 
@@ -122,7 +122,7 @@ python deepseek_merge_kv_shared.py \
 
 - The inference demo does not handle line breaks effectively; input your questions on a single line.
 - Initial loading may take around 2 minutes due to layer quantization initialization.
-- Quantized models require lower temperatures (~0.1-0.2) for coherent output. Higher values may cause unreadable results due to increased noise.
+- Quantized models require lower temperatures (~0.05-0.1) for coherent output. Higher values may cause unreadable results due to increased noise.
 - NCCL may time out during prolonged periods without data input.
 
 ---
